@@ -25,10 +25,33 @@ import sys
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from .modeling_utils import PreTrainedModel, prune_linear_layer
 from .configuration_bert import BertConfig
 from .file_utils import add_start_docstrings
+
+# from GAT here
+from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GCNConv, GATConv
+from torch.nn import Parameter
+from torch_scatter import scatter_add
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.utils import add_remaining_self_loops, remove_self_loops, add_self_loops, softmax
+from torch_geometric.nn.inits import glorot, zeros
+
+
+
+import random
+import numpy as np
+
+INF = 1e30 # 定义正无穷
+
+# set seed here(set the same with your run_xxx.py file)
+# random.seed(42)
+# np.random.seed(42)
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
 
 logger = logging.getLogger(__name__)
 
@@ -1271,3 +1294,658 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+###############################################################################################################################################
+# below is authored by yyhaker
+class KTNetForQuestionAnswering(BertPreTrainedModel):
+    r"""
+        **start_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+        **end_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Total span extraction loss is the sum of a Cross-Entropy for the start and end positions.
+        **start_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-start scores (before SoftMax).
+        **end_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-end scores (before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+        question, text = "Who was Jim Henson?", "Jim Henson was a nice puppet"
+        input_text = "[CLS] " + question + " [SEP] " + text + " [SEP]"
+        input_ids = tokenizer.encode(input_text)
+        token_type_ids = [0 if i <= input_ids.index(102) else 1 for i in range(len(input_ids))] 
+        start_scores, end_scores = model(torch.tensor([input_ids]), token_type_ids=torch.tensor([token_type_ids]))
+        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)  
+        print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
+        # a nice puppet
+    """
+    def __init__(self, config, concept_embedding_mat):
+        super(KTNetForQuestionAnswering, self).__init__(config, concept_embedding_mat)
+        self.num_labels = config.num_labels
+        
+        '''1st Layer: BERT Encoding Layer'''
+        self.bert = BertModel(config)
+
+        '''2st Layer: Knowledge Integration Layer'''
+        self.memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(concept_embedding_mat), freeze=True)
+
+        concept_vocab_size = concept_embedding_mat.shape[0]
+        concept_dim = concept_embedding_mat.shape[1]
+
+        # init a sentinel vector
+        self.sentinel_vec = torch.nn.Parameter(torch.rand(concept_dim), requires_grad=False)
+
+        # init a sentinel vector
+        # elf.sentinel_vec = torch.nn.Parameter(torch.zeros(concept_dim), requires_grad=True)
+
+        self.relavance_layer = torch.nn.Bilinear(config.hidden_size, concept_dim, 1)
+
+        self.trilinear = torch.nn.Linear(3 * (config.hidden_size + concept_dim), 1)
+
+        self.qa_outputs = torch.nn.Linear(6 * (config.hidden_size + concept_dim), config.num_labels)
+
+        # self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.init_weights()
+    
+    def self_matching(self, U, mask):
+        '''self-matching layer.
+            U, (b, len, d)
+            mask, (b, len)
+        '''
+        b, len_, d = U.size()
+
+        # direct info interaction
+        ui = U.unsqueeze(2) # [b, len, 1, d]
+        uj = U.unsqueeze(1) # [b, 1, len, d]
+        dot = ui * uj  # [b, len, len, d]
+        ui_expand = ui.expand(b, len_, len_, d).contiguous() # [b, len, len, d] 
+        uj_expand = uj.expand(b, len_, len_, d).contiguous() # [b, len, len, d]
+        R = self.trilinear(torch.cat((ui_expand, uj_expand, dot), -1)).squeeze(-1) # [b, len, len, 3 * d] -> [b, len, len, 1] -> [b, len, len]
+        mask_expand = mask.unsqueeze(-1).expand(b, len_, len_).contiguous() # [b, len, len]
+        R = INF * (mask_expand.float() - 1.0) + R   # mask here
+        A = torch.nn.functional.softmax(R, -1) # [b, len, len]
+        V = torch.bmm(A, U) # [b, len, d]
+
+        # indirect info interaction
+        A_hat = torch.bmm(A, A)  # [b, len, len]
+        V_hat = torch.bmm(A_hat, U) # [b, len, d]
+        O = torch.cat((U, V, U - V, U * V, V_hat, U - V_hat), -1) # [b, len, 6*d]
+        return O
+
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
+                start_positions=None, end_positions=None, concept_ids=None):
+        
+        '''1st Layer: Bert Layer'''
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds)
+
+        sequence_output = outputs[0] # [batch_size, seq_length, hidden_size]
+        batch_size, seq_length, hidden_size = sequence_output.size()
+
+        '''2nd Layer: Knowledge Integration Layer'''
+        concept_emb = self.memory_embs(concept_ids) # [batch_size, seq_length, num_concepts, cpnet_dim]
+        num_concepts = concept_emb.size()[2]
+        cpnet_dim = concept_emb.size()[3]
+        
+        # add sentinel vector
+        sentinel_vec = self.sentinel_vec.to(concept_emb.device)
+        sentinel_vec_expand = sentinel_vec.expand(batch_size, seq_length, cpnet_dim).unsqueeze(2).contiguous()  # [batch_size, seq_length, 1, cpnet_dim]
+        
+        concept_emb_add = torch.cat((concept_emb, sentinel_vec_expand), 2)  # [batch_size, seq_length, num_concepts + 1, cpnet_dim]
+
+        sequence_output_expand = sequence_output.unsqueeze(2).expand(batch_size, seq_length, num_concepts + 1, hidden_size).contiguous() # [batch_size, seq_length, num_concepts + 1, hidden_size]
+
+        similarity_weight = self.relavance_layer(sequence_output_expand, concept_emb_add).squeeze(-1) # [batch_size, seq_length, num_concepts + 1]
+        
+        similarity_weight_softmax = torch.nn.functional.softmax(similarity_weight, -1)
+
+        concept_relavance = torch.bmm(similarity_weight_softmax.unsqueeze(2).reshape(batch_size * seq_length, 1, -1),
+            concept_emb_add.reshape(batch_size*seq_length, num_concepts + 1, -1))  # [batch_size * seq_length, 1, cpnet_dim]
+        concept_relavance = concept_relavance.squeeze(1).reshape(batch_size, seq_length, -1) # [batch_size, seq_length, cpnet_dim]
+        
+        # mask and cat representation
+        attention_mask_expand = attention_mask.unsqueeze(-1).expand(batch_size, seq_length, cpnet_dim).contiguous() # [batch_size, seq_length, cpnet_dim]
+        concept_relavance = attention_mask_expand.float() * concept_relavance
+        sequence_kg_output = torch.cat((sequence_output, concept_relavance), dim=-1) # [batch_size, seq_length, hidden_size + cpnet_dim]
+
+        '''3nd Layer: Self-Matching Layer'''
+        sequence_kg_output = self.self_matching(sequence_kg_output, attention_mask)
+
+        # residule connection
+        # sequence_kg_output = torch.cat((sequence_output, sequence_kg_output), dim=-1)
+
+        '''4nd Layer: Output Layer'''
+        logits = self.qa_outputs(sequence_kg_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        outputs = (start_logits, end_logits,) + outputs[2:]
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+            outputs = (total_loss,) + outputs
+
+        return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+# here KT-NET support (wordnet and nell)
+class KTNetForQuestionAnswering_both(BertPreTrainedModel):
+    r"""
+        **start_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+        **end_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Total span extraction loss is the sum of a Cross-Entropy for the start and end positions.
+        **start_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-start scores (before SoftMax).
+        **end_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-end scores (before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+        question, text = "Who was Jim Henson?", "Jim Henson was a nice puppet"
+        input_text = "[CLS] " + question + " [SEP] " + text + " [SEP]"
+        input_ids = tokenizer.encode(input_text)
+        token_type_ids = [0 if i <= input_ids.index(102) else 1 for i in range(len(input_ids))] 
+        start_scores, end_scores = model(torch.tensor([input_ids]), token_type_ids=torch.tensor([token_type_ids]))
+        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)  
+        print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
+        # a nice puppet
+    """
+    def __init__(self, config, wn_concept_embedding_mat, nell_concept_embedding_mat):
+        super(KTNetForQuestionAnswering_both, self).__init__(config, wn_concept_embedding_mat, nell_concept_embedding_mat)
+        self.num_labels = config.num_labels
+        
+        '''1st Layer: BERT Encoding Layer'''
+        self.bert = BertModel(config)
+
+        '''2st Layer: Knowledge Integration Layer'''
+        self.wn_memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(wn_concept_embedding_mat), freeze=True)
+        self.nell_memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(nell_concept_embedding_mat), freeze=True)
+
+        wn_concept_vocab_size = wn_concept_embedding_mat.shape[0]
+        wn_concept_dim = wn_concept_embedding_mat.shape[1]
+
+        nell_concept_vocab_size = nell_concept_embedding_mat.shape[0]
+        nell_concept_dim = wn_concept_embedding_mat.shape[1]
+
+        assert wn_concept_dim == nell_concept_dim
+        self.cpnet_dim = wn_concept_dim
+
+        # init a sentinel vector
+        self.sentinel_vec = torch.nn.Parameter(torch.rand(self.cpnet_dim), requires_grad=False)
+
+        self.wn_relavance_layer = torch.nn.Bilinear(config.hidden_size, self.cpnet_dim, 1)
+        self.nell_relavance_layer = torch.nn.Bilinear(config.hidden_size, self.cpnet_dim, 1)
+
+        self.trilinear = torch.nn.Linear(3 * (config.hidden_size + 2 * self.cpnet_dim), 1)
+
+        self.qa_outputs = torch.nn.Linear(6 * (config.hidden_size + 2 * self.cpnet_dim), config.num_labels)
+
+        # self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.init_weights()
+    
+    def self_matching(self, U, mask):
+        '''self-matching layer.
+            U, (b, len, d)
+            mask, (b, len)
+        '''
+        b, len_, d = U.size()
+
+        # direct info interaction
+        ui = U.unsqueeze(2) # [b, len, 1, d]
+        uj = U.unsqueeze(1) # [b, 1, len, d]
+        dot = ui * uj  # [b, len, len, d]
+        ui_expand = ui.expand(b, len_, len_, d).contiguous() # [b, len, len, d] 
+        uj_expand = uj.expand(b, len_, len_, d).contiguous() # [b, len, len, d]
+        R = self.trilinear(torch.cat((ui_expand, uj_expand, dot), -1)).squeeze(-1) # [b, len, len, 3 * d] -> [b, len, len, 1] -> [b, len, len]
+        mask_expand = mask.unsqueeze(-1).expand(b, len_, len_).contiguous() # [b, len, len]
+        R = INF * (mask_expand.float() - 1.0) + R   # mask here
+        A = torch.nn.functional.softmax(R, -1) # [b, len, len]
+        V = torch.bmm(A, U) # [b, len, d]
+
+        # indirect info interaction
+        A_hat = torch.bmm(A, A)  # [b, len, len]
+        V_hat = torch.bmm(A_hat, U) # [b, len, d]
+        O = torch.cat((U, V, U - V, U * V, V_hat, U - V_hat), -1) # [b, len, 6*d]
+        return O
+    
+    def knowledge_integration(self, concept_emb, sequence_output, sentinel_vec_expand, attention_mask_expand, relavance_layer):
+        '''knowledge integration layer.
+            concept_emb: [batch_size, seq_length, num_concepts, cpnet_dim],
+            sequence_output: [batch_size, seq_length, hidden_size],
+            sentinel_vec_expand: [batch_size, seq_length, 1, cpnet_dim],
+            attention_mask_expand: [batch_size, seq_length, cpnet_dim]
+        '''
+        # get size
+        batch_size, seq_length, num_concepts, cpnet_dim = concept_emb.size()
+        _, _, hidden_size = sequence_output.size()
+        # cat emb and sentinel
+        concept_emb_add = torch.cat((concept_emb, sentinel_vec_expand), 2)  # [batch_size, seq_length, num_concepts + 1, cpnet_dim]
+        # calc similarity weight
+        sequence_output_expand = sequence_output.unsqueeze(2).expand(batch_size, seq_length, num_concepts + 1, hidden_size).contiguous() # [batch_size, seq_length, num_concepts + 1, hidden_size]
+        similarity_weight = relavance_layer(sequence_output_expand, concept_emb_add).squeeze(-1) # [batch_size, seq_length, num_concepts + 1]
+        similarity_weight_softmax = torch.nn.functional.softmax(similarity_weight, -1)
+        # attention result
+        concept_relavance = torch.bmm(similarity_weight_softmax.unsqueeze(2).reshape(batch_size * seq_length, 1, -1),
+            concept_emb_add.reshape(batch_size*seq_length, num_concepts + 1, -1))  # [batch_size * seq_length, 1, cpnet_dim]
+        concept_relavance = concept_relavance.squeeze(1).reshape(batch_size, seq_length, -1) # [batch_size, seq_length, cpnet_dim]
+        # mask the concept
+        concept_relavance = attention_mask_expand.float() * concept_relavance # [batch_size, seq_length, cpnet_dim]
+        return concept_relavance
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
+                start_positions=None, end_positions=None, wn_concept_ids=None, nell_concept_ids=None):
+        
+        '''1st Layer: Bert Layer'''
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds)
+
+        sequence_output = outputs[0] # [batch_size, seq_length, hidden_size]
+        batch_size, seq_length, hidden_size = sequence_output.size()
+
+        '''2nd Layer: Knowledge Integration Layer'''
+        # get concept emb
+        wn_concept_emb = self.wn_memory_embs(wn_concept_ids) # [batch_size, seq_length, num_concepts, cpnet_dim]
+        nell_concept_emb = self.nell_memory_embs(nell_concept_ids) # [batch_size, seq_length, num_concepts, cpnet_dim]
+
+        # add sentinel vector
+        sentinel_vec = self.sentinel_vec.to(sequence_output.device)
+        sentinel_vec_expand = sentinel_vec.expand(batch_size, seq_length, self.cpnet_dim).unsqueeze(2).contiguous()  # [batch_size, seq_length, 1, cpnet_dim]
+        
+        # mask and cat representation
+        attention_mask_expand = attention_mask.unsqueeze(-1).expand(batch_size, seq_length, self.cpnet_dim).contiguous() # [batch_size, seq_length, cpnet_dim]
+        
+        # knowledge integration
+        wn_concept_relavance = self.knowledge_integration(wn_concept_emb, sequence_output, sentinel_vec_expand, attention_mask_expand, self.wn_relavance_layer)
+        nell_concept_relavance = self.knowledge_integration(nell_concept_emb, sequence_output, sentinel_vec_expand, attention_mask_expand, self.nell_relavance_layer)
+
+        sequence_output = torch.cat((sequence_output, wn_concept_relavance, nell_concept_relavance), dim=-1) # [batch_size, seq_length, hidden_size + cpnet_dim * 2]
+
+        '''3nd Layer: Self-Matching Layer'''
+        sequence_output = self.self_matching(sequence_output, attention_mask) # [batch_size, seq_length, 6 * (hidden_size + cpnet_dim * 2)]
+
+        '''4nd Layer: Output Layer'''
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        outputs = (start_logits, end_logits,) + outputs[2:]
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+            outputs = (total_loss,) + outputs
+
+        return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+# SKG-NET for QA models here
+class SKGNetForQuestionAnswering(BertPreTrainedModel):
+    r"""
+        **start_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+        **end_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Total span extraction loss is the sum of a Cross-Entropy for the start and end positions.
+        **start_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-start scores (before SoftMax).
+        **end_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-end scores (before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+        question, text = "Who was Jim Henson?", "Jim Henson was a nice puppet"
+        input_text = "[CLS] " + question + " [SEP] " + text + " [SEP]"
+        input_ids = tokenizer.encode(input_text)
+        token_type_ids = [0 if i <= input_ids.index(102) else 1 for i in range(len(input_ids))] 
+        start_scores, end_scores = model(torch.tensor([input_ids]), token_type_ids=torch.tensor([token_type_ids]))
+        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)  
+        print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
+        # a nice puppet
+    """
+    def __init__(self, config, device, entity_emb_mat, relation_emb_mat):
+        super(SKGNetForQuestionAnswering, self).__init__(config, device, entity_emb_mat, relation_emb_mat)
+        self.num_labels = config.num_labels
+        self.device = device
+        
+        '''1st Layer: BERT Encoding Layer'''
+        self.bert = BertModel(config)
+
+        '''2st Layer: Knowledge subgraph Layer'''
+        self.entity_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(entity_emb_mat), freeze=True)
+        self.relation_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(relation_emb_mat), freeze=True)
+
+        concept_dim = entity_emb_mat.shape[1]
+
+        '''3st Layer: Graph Attention Layer'''
+        self.conv = GATConv(concept_dim, concept_dim, heads=8, dropout=config.hidden_dropout_prob)
+
+        '''4st Layer: Output Layer'''
+        self.qa_outputs = torch.nn.Linear(config.hidden_size + 8 * concept_dim, config.num_labels)
+
+        # self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.init_weights()
+    
+    def to_device(self, tensor):
+        '''move tensor to device'''
+        if tensor is not None:
+            return tensor.to(self.device)
+        else:
+            return None
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
+                start_positions=None, end_positions=None, core_entity_ids=None, graph_data_dict=None):
+        # get sub graph info, and combine batch sub-graph
+        # print("graph ids lens: {}".format(len(example_graph_info)))
+        # nodes_ids_list = torch.tensor([node_id[0] for node_id in example_graph_info["nodes_ids"]]).numpy().tolist()
+        # core_entity_ids_list = core_entity_ids[0].numpy().tolist()
+        # core_entity_index_list = []
+        # for entity in core_entity_ids_list:
+        #     if entity in nodes_ids_list:
+        #         idx = nodes_ids_list.index(entity)
+        #     else:
+        #         k = entity
+        #         idx = 0
+        #     core_entity_index_list.append(idx)
+
+        # nodes_ids_list = sorted(list(set(nodes_ids_list)))
+        # sort_nodes_ids_list = list(set(nodes_ids_list))
+        # graph_data_dict = graph_data_dict
+            
+        # core_entity_index_list = [nodes_ids_list.index(entity) for entity in core_entity_ids_list]
+        # core_entity_index = torch.tensor(core_entity_index_list, dtype=torch.long)
+        # core_entity_index = self.to_device(core_entity_index)
+
+        # set all tensors to device
+        input_ids = self.to_device(input_ids)
+        attention_mask = self.to_device(attention_mask)
+        token_type_ids = self.to_device(token_type_ids)
+        position_ids = self.to_device(position_ids)
+        head_mask = self.to_device(head_mask)
+        inputs_embeds = self.to_device(inputs_embeds)
+        start_positions = self.to_device(start_positions)
+        end_positions = self.to_device(end_positions)
+        core_entity_ids = self.to_device(core_entity_ids)
+        
+        '''1st Layer: Bert Layer'''
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds)
+
+        sequence_output = outputs[0] # [batch_size, seq_length, hidden_size]
+        batch_size, seq_length, hidden_size = sequence_output.size()
+ 
+        '''2nd Layer: Knowledge subgraph Layer'''
+        # # get sub graph info, and combine batch sub-graph
+        # x_ids = torch.tensor([node_id[0] for node_id in example_graph_info["nodes_ids"]], dtype=torch.long)
+        # x_ids = self.to_device(x_ids)
+        # x = self.entity_embs(x_ids)  # [num_nodes, node_features]
+        # x = self.to_device(x)
+
+        # edges_ids = torch.tensor(example_graph_info["edges_ids"], dtype=torch.long) # [2, num_edges]
+        # edges_ids = self.to_device(edges_ids)
+
+        # edges_attr_ids = torch.tensor([edge_attr_id[0] for edge_attr_id in example_graph_info["edges_attr_ids"]], dtype=torch.long)
+        # edges_attr_ids = self.to_device(edges_attr_ids)
+        # edges_attr = self.relation_embs(edges_attr_ids) # [num_edges, edge_features]
+
+        # graph = Data(x=x, edge_index=edges_ids.t().contiguous())
+
+        nodes_features = graph_data_dict["nodes_features"] # [b, nodes_nums, feature_dim]
+        edges_index = graph_data_dict["edges_index"] # [b, edges_nums, 2]
+        edges_attr = graph_data_dict["edges_attr"] # [b, edges_nums, feature_dim]
+
+        graph_list = []
+        for i in range(batch_size):
+            nodes_features_i = nodes_features[i]
+            edges_index_i = edges_index[i]
+            edges_attr_i = edges_attr[i]
+            graph = Data(x=nodes_features_i, edge_index=edges_index_i, edge_attr=edges_attr_i).to(self.device)
+            graph_list.append(graph)
+        graph_batch = Batch.from_data_list(graph_list)
+
+        out = self.conv(graph_batch.x, graph_batch.edge_index)
+        out_dim = out.size()[-1]
+        out = out.reshape(batch_size, -1, out_dim)    # [batch_size, num_nodes, node_features]
+
+        # find updated core entity representation
+        core_entity_emb_list = []
+        for i in range(batch_size):
+            core_entity_emb = torch.index_select(out[i], 0, core_entity_ids[i])
+            core_entity_emb_list.append(core_entity_emb)
+        core_entity_embs = torch.stack(core_entity_emb_list).to(self.device) # [batch_size, seq_len, node_features]
+        # core_entity_embs = torch.tensor(core_entity_emb_list).to(self.device) 
+
+        # concat bert output and kg output
+        sequence_kg_output = torch.cat((sequence_output, core_entity_embs), dim=-1)
+
+        '''3nd Layer: Graph Attention Layer'''
+
+        '''4nd Layer: Output Layer'''
+        logits = self.qa_outputs(sequence_kg_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        outputs = (start_logits, end_logits,) + outputs[2:]
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+            outputs = (total_loss,) + outputs
+
+        return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+# Graph Attention Networks here
+class GATConv(MessagePassing):
+    r"""The graph attentional operator from the `"Graph Attention Networks"
+    <https://arxiv.org/abs/1710.10903>`_ paper
+    .. math::
+        \mathbf{x}^{\prime}_i = \alpha_{i,i}\mathbf{\Theta}\mathbf{x}_{i} +
+        \sum_{j \in \mathcal{N}(i)} \alpha_{i,j}\mathbf{\Theta}\mathbf{x}_{j},
+    where the attention coefficients :math:`\alpha_{i,j}` are computed as
+    .. math::
+        \alpha_{i,j} =
+        \frac{
+        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
+        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_j]
+        \right)\right)}
+        {\sum_{k \in \mathcal{N}(i) \cup \{ i \}}
+        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
+        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_k]
+        \right)\right)}.
+    Args:
+        in_channels (int): Size of each input sample.
+        out_channels (int): Size of each output sample.
+        heads (int, optional): Number of multi-head-attentions.
+            (default: :obj:`1`)
+        concat (bool, optional): If set to :obj:`False`, the multi-head
+            attentions are averaged instead of concatenated.
+            (default: :obj:`True`)
+        negative_slope (float, optional): LeakyReLU angle of the negative
+            slope. (default: :obj:`0.2`)
+        dropout (float, optional): Dropout probability of the normalized
+            attention coefficients which exposes each node to a stochastically
+            sampled neighborhood during training. (default: :obj:`0`)
+        bias (bool, optional): If set to :obj:`False`, the layer will not learn
+            an additive bias. (default: :obj:`True`)
+        **kwargs (optional): Additional arguments of
+            :class:`torch_geometric.nn.conv.MessagePassing`.
+    """
+    def __init__(self, in_channels, out_channels, heads=1, concat=True,
+                 negative_slope=0.2, dropout=0, bias=True, **kwargs):
+        super(GATConv, self).__init__(aggr='add', **kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.heads = heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = dropout
+
+        self.weight = Parameter(torch.Tensor(in_channels,
+                                             heads * out_channels))
+        self.att = Parameter(torch.Tensor(1, heads, 2 * out_channels))
+
+        if bias and concat:
+            self.bias = Parameter(torch.Tensor(heads * out_channels))
+        elif bias and not concat:
+            self.bias = Parameter(torch.Tensor(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.weight)
+        glorot(self.att)
+        zeros(self.bias)
+
+    def forward(self, x, edge_index, size=None):
+        """"""
+        if size is None and torch.is_tensor(x):
+            edge_index, _ = remove_self_loops(edge_index)
+            edge_index, _ = add_self_loops(edge_index,
+                                           num_nodes=x.size(self.node_dim))
+
+        if torch.is_tensor(x):
+            x = torch.matmul(x, self.weight)
+        else:
+            x = (None if x[0] is None else torch.matmul(x[0], self.weight),
+                 None if x[1] is None else torch.matmul(x[1], self.weight))
+
+        return self.propagate(edge_index, size=size, x=x)
+
+    def message(self, edge_index_i, x_i, x_j, size_i):
+        # Compute attention coefficients.
+        x_j = x_j.view(-1, self.heads, self.out_channels)
+        if x_i is None:
+            alpha = (x_j * self.att[:, :, self.out_channels:]).sum(dim=-1)
+        else:
+            x_i = x_i.view(-1, self.heads, self.out_channels)
+            alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+
+        alpha = F.leaky_relu(alpha, self.negative_slope)
+        alpha = softmax(alpha, edge_index_i, size_i)
+
+        # Sample attention coefficients stochastically.
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        return x_j * alpha.view(-1, self.heads, 1)
+
+    def update(self, aggr_out):
+        if self.concat is True:
+            aggr_out = aggr_out.view(-1, self.heads * self.out_channels)
+        else:
+            aggr_out = aggr_out.mean(dim=1)
+
+        if self.bias is not None:
+            aggr_out = aggr_out + self.bias
+        return aggr_out
+
+    def __repr__(self):
+        return '{}({}, {}, heads={})'.format(self.__class__.__name__,
+                                             self.in_channels,
+                                             self.out_channels, self.heads)

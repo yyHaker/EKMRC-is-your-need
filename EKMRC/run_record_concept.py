@@ -17,12 +17,17 @@
 
 from __future__ import absolute_import, division, print_function
 
+import sys
+sys.path.append(".")
+
 import argparse
 import logging
 import os
 import random
 import glob
 import timeit
+
+import heapq
 
 import numpy as np
 import torch
@@ -38,6 +43,7 @@ except:
 from tqdm import tqdm, trange
 
 from transformers import (WEIGHTS_NAME, BertConfig,
+                                  KTNetForQuestionAnswering,
                                   BertForQuestionAnswering, BertTokenizer,
                                   XLMConfig, XLMForQuestionAnswering,
                                   XLMTokenizer, XLNetConfig,
@@ -45,16 +51,16 @@ from transformers import (WEIGHTS_NAME, BertConfig,
                                   XLNetTokenizer,
                                   DistilBertConfig, DistilBertForQuestionAnswering, DistilBertTokenizer)
 
-from transformers import AdamW, WarmupLinearSchedule
+from transformers import AdamW, WarmupLinearSchedule, WarmupCosineSchedule
 
-from utils_squad import (read_squad_examples, convert_examples_to_features,
+from utils_record_concept import (read_record_examples, convert_examples_to_features, read_squad_examples,
                          RawResult, write_predictions,
                          RawResultExtended, write_predictions_extended)
 
 # The follwing import is the official SQuAD evaluation script (2.0).
 # You can remove it from the dependencies if you are using this script outside of the library
 # We've added it here for automated tests (see examples/test_examples.py file)
-from utils_squad_evaluate import EVAL_OPTS, main as evaluate_on_squad
+from utils_record_evaluate import EVAL_OPTS, main as evaluate_on_record
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +68,13 @@ ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) \
                   for conf in (BertConfig, XLNetConfig, XLMConfig)), ())
 
 MODEL_CLASSES = {
+    'ktnet': (BertConfig, KTNetForQuestionAnswering, BertTokenizer),
     'bert': (BertConfig, BertForQuestionAnswering, BertTokenizer),
     'xlnet': (XLNetConfig, XLNetForQuestionAnswering, XLNetTokenizer),
     'xlm': (XLMConfig, XLMForQuestionAnswering, XLMTokenizer),
     'distilbert': (DistilBertConfig, DistilBertForQuestionAnswering, DistilBertTokenizer)
 }
+
 
 def set_seed(args):
     random.seed(args.seed)
@@ -81,7 +89,8 @@ def to_list(tensor):
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
     if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+        # here set log dir for visulization
+        tb_writer = SummaryWriter(comment=args.log_comment)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
@@ -99,8 +108,20 @@ def train(args, train_dataset, model, tokenizer):
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
+        
+    # if freeze BERT parameters
+    if args.freeze_bert:
+        for params in model.bert.parameters():
+            params.requires_grad = False
+
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
+    if args.scheduler == "linear":
+        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+    elif args.scheduler == "cosine":
+        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
+
     if args.fp16:
         try:
             from apex import amp
@@ -130,7 +151,7 @@ def train(args, train_dataset, model, tokenizer):
 
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
-    model.zero_grad()
+    model.zero_grad() 
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
     for _ in train_iterator:
@@ -138,10 +159,11 @@ def train(args, train_dataset, model, tokenizer):
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':       batch[0],
+            inputs = {'input_ids':       batch[0], 
                       'attention_mask':  batch[1],
                       'start_positions': batch[3],
-                      'end_positions':   batch[4]}
+                      'end_positions':   batch[4],
+                      'concept_ids': batch[7]}
             if args.model_type != 'distilbert':
                 inputs['token_type_ids'] = None if args.model_type == 'xlm' else batch[2]
             if args.model_type in ['xlnet', 'xlm']:
@@ -228,7 +250,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
             inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1]
+                      'attention_mask': batch[1],
+                      'concept_ids': batch[6]
                       }
             if args.model_type != 'distilbert':
                 inputs['token_type_ids'] = None if args.model_type == 'xlm' else batch[2]  # XLM don't use segment_ids
@@ -283,28 +306,75 @@ def evaluate(args, model, tokenizer, prefix=""):
     evaluate_options = EVAL_OPTS(data_file=args.predict_file,
                                  pred_file=output_prediction_file,
                                  na_prob_file=output_null_log_odds_file)
-    results = evaluate_on_squad(evaluate_options)
+    
+    results = evaluate_on_record(evaluate_options)
+    
+    # TODO: Evaluate with the official ReCoRD script
+
     return results
+
+def read_concept_embedding(embedding_path):
+    fin = open(embedding_path, encoding='utf-8')
+    info = [line.strip() for line in fin]
+    dim = len(info[0].split(' ')[1:])
+    n_concept = len(info)
+    embedding_mat = []
+    id2concept, concept2id = [], {}
+    # add padding concept into vocab
+    id2concept.append('<pad_concept>')
+    concept2id['<pad_concept>'] = 0
+    embedding_mat.append([0.0 for _ in range(dim)])
+    for line in info:
+        concept_name = line.split(' ')[0]
+        embedding = [float(value_str) for value_str in line.split(' ')[1:]] 
+        assert len(embedding) == dim and not np.any(np.isnan(embedding))
+        embedding_mat.append(embedding)
+        concept2id[concept_name] = len(id2concept)
+        id2concept.append(concept_name)
+    embedding_mat = np.array(embedding_mat, dtype=np.float32)
+    return id2concept, concept2id, embedding_mat
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
+    # load concept embedding mat(only support add one kind concept)
+    # here one of wordnet and nell must be used
+    if args.use_wordnet:
+        logger.info("load wordnet embeddings....")
+        id2concept, concept2id, embedding_mat = read_concept_embedding("EKMRC/data/retrived_kb_data/kb_embeddings/wn_concept2vec.txt")
+    elif args.use_nell:
+        logger.info("load nell embeddings....")
+        id2concept, concept2id, embedding_mat = read_concept_embedding("EKMRC/data/retrived_kb_data/kb_embeddings/nell_concept2vec.txt")
+
     # Load data features from cache or dataset file
     input_file = args.predict_file if evaluate else args.train_file
-    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_{}_{}_{}'.format(
+    cpnet_name = "wordnet" if args.use_wordnet else "nell"
+
+    # change the cache name according to the args.model_name_or_path
+    cache_name = list(filter(None, args.model_name_or_path.split('/'))).pop()
+    if "stage1" in cache_name:
+        if "ktnet" in cache_name and "large" in cache_name:
+            cache_name = "bert-large-cased"
+        elif "ktnet" in cache_name and "base" in cahce_name:
+            cache_name = "bert-base-cased"
+
+    cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_{}_{}_{}_{}'.format(
         'dev' if evaluate else 'train',
-        list(filter(None, args.model_name_or_path.split('/'))).pop(),
+        cache_name,
+        cpnet_name,
         str(args.max_seq_length)))
+    
     if os.path.exists(cached_features_file) and not args.overwrite_cache and not output_examples:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
     else:
         logger.info("Creating features from dataset file at %s", input_file)
-        examples = read_squad_examples(input_file=input_file,
+        examples = read_record_examples(input_file=input_file,
                                                 is_training=not evaluate,
                                                 version_2_with_negative=args.version_2_with_negative)
+        
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 max_seq_length=args.max_seq_length,
@@ -314,7 +384,13 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
                                                 cls_token_segment_id=2 if args.model_type in ['xlnet'] else 0,
                                                 pad_token_segment_id=3 if args.model_type in ['xlnet'] else 0,
                                                 cls_token_at_end=True if args.model_type in ['xlnet'] else False,
-                                                sequence_a_is_doc=True if args.model_type in ['xlnet'] else False)
+                                                sequence_a_is_doc=True if args.model_type in ['xlnet'] else False,
+                                                tokenization_path=args.tokenization_path,
+                                                concept2id=concept2id,
+                                                retrieved_nell_concept_path=args.retrieved_nell_concept_path,
+                                                retrieved_wordnet_concept_path=args.retrieved_wordnet_concept_path,
+                                                use_wordnet=args.use_wordnet,
+                                                use_nell=args.use_nell)
         if args.local_rank in [-1, 0]:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
@@ -328,36 +404,59 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
     all_cls_index = torch.tensor([f.cls_index for f in features], dtype=torch.long)
     all_p_mask = torch.tensor([f.p_mask for f in features], dtype=torch.float)
+    ## concept ids here
+    all_concept_ids = torch.tensor([f.concept_ids for f in features], dtype=torch.long)
     if evaluate:
         all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
         dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                                all_example_index, all_cls_index, all_p_mask)
+                                all_example_index, all_cls_index, all_p_mask, all_concept_ids)
     else:
         all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
         all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
         dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
                                 all_start_positions, all_end_positions,
-                                all_cls_index, all_p_mask)
+                                all_cls_index, all_p_mask, all_concept_ids)
 
     if output_examples:
         return dataset, examples, features
-    return dataset
+    return dataset, embedding_mat
+
 
 
 def main():
     parser = argparse.ArgumentParser()
 
+    # os.environ['CUDA_VISIBLE_DEVICES']='0'
+
     ## Required parameters
-    parser.add_argument("--train_file", default=None, type=str, required=True,
+    parser.add_argument("--train_file", default="EKMRC/data/ReCoRD/train.json", type=str,
                         help="SQuAD json for training. E.g., train-v1.1.json")
-    parser.add_argument("--predict_file", default=None, type=str, required=True,
+    parser.add_argument("--predict_file", default="EKMRC/data/ReCoRD/dev.json", type=str,
                         help="SQuAD json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
-    parser.add_argument("--model_type", default=None, type=str, required=True,
+    parser.add_argument("--model_type", default="ktnet", type=str,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+    parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str,
                         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
-    parser.add_argument("--output_dir", default=None, type=str, required=True,
+    parser.add_argument("--output_dir", default="EKMRC/results/debug_ReCoRD", type=str,
                         help="The output directory where the model checkpoints and predictions will be written.")
+
+    # for concept params
+    parser.add_argument("--embedding_path", default="EKMRC/data/retrived_kb_data/kb_embeddings/nell_concept2vec.txt", type=str,
+                        help="the pretrained concept embedding path")
+    parser.add_argument("--retrieved_nell_concept_path", default="EKMRC/data/retrived_kb_data/nell_record_self", type=str,
+                        help="retrievedd nell concept path")
+    parser.add_argument("--retrieved_wordnet_concept_path", default="EKMRC/data/retrived_kb_data/wordnet_record", type=str,
+                        help="retrieved wordnet concept path")
+    parser.add_argument("--use_wordnet", action='store_true', help="if use wordnet")
+    parser.add_argument("--use_nell", action='store_true', help="is use nell")
+    
+    # data path
+    parser.add_argument("--tokenization_path", default="EKMRC/data/ReCoRD_tokenization/tokens_self", type=str,
+                        help="tokenization path")
+    
+    # log data path（use default dir runs）
+    # parser.add_argument("--save_log_dir", default="EKMRC/log_dir", type=str, help="saved log dir")
+    parser.add_argument("--log_comment", default="ktnet", type=str, help="log file comment")
 
     ## Other parameters
     parser.add_argument("--config_name", default="", type=str,
@@ -380,20 +479,22 @@ def main():
     parser.add_argument("--max_query_length", default=64, type=int,
                         help="The maximum number of tokens for the question. Questions longer than this will "
                              "be truncated to this length.")
-    parser.add_argument("--do_train", action='store_true',
+    parser.add_argument("--do_train", action='store_true', default=False,
                         help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true',
+    parser.add_argument("--do_eval", action='store_true', default=False,
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--evaluate_during_training", action='store_true',
                         help="Rul evaluation during training at each logging step.")
-    parser.add_argument("--do_lower_case", action='store_true',
+    parser.add_argument("--do_lower_case", action='store_true', default=True,
                         help="Set this flag if you are using an uncased model.")
+    
+    parser.add_argument("--scheduler", default="linear", type=str, help="optimization scheduler")
 
-    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
+    parser.add_argument("--per_gpu_train_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--per_gpu_eval_batch_size", default=8, type=int,
+    parser.add_argument("--per_gpu_eval_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument("--learning_rate", default=5e-5, type=float,
+    parser.add_argument("--learning_rate", default=3e-5, type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -417,18 +518,20 @@ def main():
     parser.add_argument("--verbose_logging", action='store_true',
                         help="If true, all of the warnings related to data processing will be printed. "
                              "A number of warnings are expected for a normal SQuAD evaluation.")
+    parser.add_argument("--freeze_bert", action='store_true', 
+                        help="If true, all of the BERT parameters are freezed")
 
-    parser.add_argument('--logging_steps', type=int, default=50,
+    parser.add_argument('--logging_steps', type=int, default=4275,
                         help="Log every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=50,
+    parser.add_argument('--save_steps', type=int, default=4275,
                         help="Save checkpoint every X updates steps.")
     parser.add_argument("--eval_all_checkpoints", action='store_true',
                         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
                         help="Whether not to use CUDA when available")
-    parser.add_argument('--overwrite_output_dir', action='store_true',
+    parser.add_argument('--overwrite_output_dir', action='store_true', default=True,
                         help="Overwrite the content of the output directory")
-    parser.add_argument('--overwrite_cache', action='store_true',
+    parser.add_argument('--overwrite_cache', action='store_true', default=False,
                         help="Overwrite the cached training and evaluation sets")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
@@ -487,10 +590,18 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
                                                 do_lower_case=args.do_lower_case,
                                                 cache_dir=args.cache_dir if args.cache_dir else None)
+    
+    if args.do_train:
+        train_dataset, concept_embedding_mat = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
+    else:
+        _, concept_embedding_mat = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=False)
+
+    # Instantiate a pretrained pytorch model from a pre-trained model configuration
     model = model_class.from_pretrained(args.model_name_or_path,
                                         from_tf=bool('.ckpt' in args.model_name_or_path),
                                         config=config,
-                                        cache_dir=args.cache_dir if args.cache_dir else None)
+                                        cache_dir=args.cache_dir if args.cache_dir else None,
+                                        concept_embedding_mat=concept_embedding_mat)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -511,7 +622,7 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
+        # train_dataset, concept_embedding_mat = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
@@ -533,7 +644,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
         # Load a trained model and vocabulary that you have fine-tuned
-        model = model_class.from_pretrained(args.output_dir)
+        model = model_class.from_pretrained(args.output_dir, concept_embedding_mat=concept_embedding_mat)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
 
@@ -548,11 +659,21 @@ def main():
 
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
+        logger.info("checkpoints below....")
         for checkpoint in checkpoints:
+            logger.info("checkponit path {}".format(checkpoint))
+
+        for checkpoint in checkpoints:
+            # pass the last one
+            if "checkpoint" not in checkpoint:
+                continue
             # Reload the model
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
-            model = model_class.from_pretrained(checkpoint)
+            model = model_class.from_pretrained(checkpoint, concept_embedding_mat=concept_embedding_mat)
             model.to(args.device)
+
+            logger.info("Evaluating......")
+            logger.info("Evaluating models {}".format(model))
 
             # Evaluate
             result = evaluate(args, model, tokenizer, prefix=global_step)
@@ -560,7 +681,11 @@ def main():
             result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
             results.update(result)
 
-    logger.info("Results: {}".format(results))
+
+    # logger.info("Results: {}".format(results))
+    logger.info("Results: ")
+    for k,v in results.items():
+        logger.info("{} : {}".format(k, v))
 
     return results
 

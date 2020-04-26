@@ -147,9 +147,9 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
                 if is_training:
                     if version_2_with_negative:
                         is_impossible = qa["is_impossible"]
-                    if (len(qa["answers"]) != 1) and (not is_impossible):
-                        raise ValueError(
-                            "For training, each question should have exactly 1 answer.")
+                    # if (len(qa["answers"]) != 1) and (not is_impossible):
+                    #     raise ValueError(
+                    #         "For training, each question should have exactly 1 answer.")
                     if not is_impossible:
                         answer = qa["answers"][0]
                         orig_answer_text = answer["text"]
@@ -187,6 +187,87 @@ def read_squad_examples(input_file, is_training, version_2_with_negative):
     return examples
 
 
+def read_record_examples(input_file, is_training, version_2_with_negative=False):
+    """Read a ReCoRD json file into a list of ReCoRDExample."""
+    with open(input_file, "r") as reader:
+        input_data = json.load(reader)["data"]
+
+    def is_whitespace(c):
+        if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
+            return True
+        return False
+
+    examples = []
+    for entry in input_data:
+        # white space tokenization
+        paragraph_text = entry["passage"]["text"].replace('\xa0', ' ')
+        doc_tokens = []
+        char_to_word_offset = []
+        prev_is_whitespace = True
+        for c in paragraph_text:
+            if is_whitespace(c):
+                prev_is_whitespace = True
+            else:
+                if prev_is_whitespace:
+                    doc_tokens.append(c)
+                else:
+                    doc_tokens[-1] += c
+                prev_is_whitespace = False
+            char_to_word_offset.append(len(doc_tokens) - 1)
+
+        for qa in entry["qas"]:
+            qas_id = qa["id"]
+            question_text = qa["query"].replace('\xa0', ' ')
+            start_position = None
+            end_position = None
+            orig_answer_text = None
+            is_impossible = False
+            if is_training:
+                if version_2_with_negative:
+                    is_impossible = qa["is_impossible"]
+                # if (len(qa["answers"]) != 1) and (not is_impossible):
+                #     raise ValueError(
+                #         "For training, each question should have exactly 1 answer."
+                #     )
+                if not is_impossible:
+                    # just chose the first one?
+                    answer = qa["answers"][0]
+                    orig_answer_text = answer["text"]
+                    answer_offset = answer["start"]
+                    answer_length = len(orig_answer_text)
+                    start_position = char_to_word_offset[answer_offset]
+                    end_position = char_to_word_offset[answer_offset +
+                                                        answer_length - 1]
+                    # Only add answers where the text can be exactly recovered from the
+                    # document. If this CAN'T happen it's likely due to weird Unicode
+                    # stuff so we will just skip the example.
+                    #
+                    # Note that this means for training mode, every example is NOT
+                    # guaranteed to be preserved.
+                    actual_text = " ".join(doc_tokens[start_position:(
+                        end_position + 1)])
+                    cleaned_answer_text = " ".join(whitespace_tokenize(orig_answer_text))
+                    if actual_text.find(cleaned_answer_text) == -1:
+                        logger.info("Could not find answer: '%s' vs. '%s'",
+                                actual_text, cleaned_answer_text)
+                        continue
+                else:
+                    start_position = -1
+                    end_position = -1
+                    orig_answer_text = ""
+
+            example = SquadExample(
+                qas_id=qas_id,
+                question_text=question_text,
+                doc_tokens=doc_tokens,
+                orig_answer_text=orig_answer_text,
+                start_position=start_position,
+                end_position=end_position,
+                is_impossible=is_impossible)
+            examples.append(example)
+
+    return examples
+
 def convert_examples_to_features(examples, tokenizer, max_seq_length,
                                  doc_stride, max_query_length, is_training,
                                  cls_token_at_end=False,
@@ -202,6 +283,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     # max_N, max_M = 1024, 1024
     # f = np.zeros((max_N, max_M), dtype=np.float32)
 
+    # add 
+
     features = []
     for (example_index, example) in enumerate(tqdm(examples)):
 
@@ -210,12 +293,14 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
 
         query_tokens = tokenizer.tokenize(example.question_text)
 
+        # control the question length after word_piece_tokenization
         if len(query_tokens) > max_query_length:
             query_tokens = query_tokens[0:max_query_length]
 
-        tok_to_orig_index = []
-        orig_to_tok_index = []
-        all_doc_tokens = []
+        # construct origin(bert tokenization) and token(after word_piece_tokenization) mappings
+        tok_to_orig_index = [] # word_piece2origin inflection
+        orig_to_tok_index = [] # origin2word_piece inflection
+        all_doc_tokens = [] # word_piece tokens
         for (i, token) in enumerate(example.doc_tokens):
             orig_to_tok_index.append(len(all_doc_tokens))
             sub_tokens = tokenizer.tokenize(token)
@@ -370,7 +455,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                 start_position = cls_index
                 end_position = cls_index
 
-            if example_index < 20:
+            if example_index < 2:
                 logger.info("*** Example ***")
                 logger.info("unique_id: %s" % (unique_id))
                 logger.info("example_index: %s" % (example_index))
