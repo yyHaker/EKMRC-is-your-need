@@ -131,7 +131,7 @@ def get_concept_mapping(entity_path, relation_path):
     return entity2id, relation2id
     
 
-def search_triples(token, conceptnet_triples):
+def search_triples(token, conceptnet_triples, limit=20):
     """检索出头或者尾部包含该词的三元组"""
     triples = []
     core_entitys = set()
@@ -140,6 +140,9 @@ def search_triples(token, conceptnet_triples):
         head, rel, tail = triple[0], triple[1], triple[2]
         if token in head.split("_") or token in tail.split("_"):
             triples.append(triple)
+            # limit retrieved knowledge here
+            if len(triples) > limit:
+                break
             if token in head.split("_"):
                 core_entitys.add(head)
             if token in tail.split("_"):
@@ -197,7 +200,9 @@ def build_graph(triples):
         edges.append([head, tail])
         edges.append([tail, head])
         edges_attr.append(rel)
+        edges_attr.append(rel)
         token_triples.append(triple)
+    assert len(edges) == len(edges_attr)
     return nodes, edges, edges_attr, token_triples
 
 

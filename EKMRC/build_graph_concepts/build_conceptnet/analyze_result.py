@@ -18,14 +18,14 @@ with open("EKMRC/build_graph_concepts/retrieve_result/one_hop/retrived_token_gra
     token2data = pickle.load(f_in)
     count = 0
     for token, data in token2data.items():
-        token2graph = data["token2graph"]
-        token2triples = data["token2triples"]
-        nodes, edge_index, edges = token2graph
-        print("For token: {}, subgraph info: num_nodes: {}, num_edges: {}".format(token, len(nodes), len(edges)))
+        sub_graph = data["sub_graph"]
+        graph_triples = data["graph_triples"]
+        nodes, edge_index, edges = sub_graph
+        print("For token: {}, subgraph info: num_nodes: {}, num_edges: {}, graph triples: {}".format(token, len(nodes), len(edges), len(graph_triples)))
         # print("token2triples: ", token2triples)
 
         count += 1
-        if count == 10:
+        if count == 100:
             break
 
 

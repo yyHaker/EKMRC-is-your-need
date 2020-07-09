@@ -131,6 +131,9 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    args.logging_steps = t_total // args.num_train_epochs
+    logger.info("  Logging steps = %d", args.logging_steps)
+
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
@@ -186,7 +189,7 @@ def train(args, train_dataset, model, tokenizer):
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
@@ -304,9 +307,13 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         'dev' if evaluate else 'train',
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
         str(args.max_seq_length)))
-    if os.path.exists(cached_features_file) and not args.overwrite_cache and not output_examples:
+    if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
+        if output_examples:
+            examples = read_record_examples(input_file=input_file,
+                                                is_training=not evaluate,
+                                                version_2_with_negative=args.version_2_with_negative)
     else:
         logger.info("Creating features from dataset file at %s", input_file)
         examples = read_record_examples(input_file=input_file,
@@ -355,18 +362,17 @@ def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters
-    parser.add_argument("--train_file", default="EKMRC/data/ReCoRD/train.json", type=str,
-                        help="SQuAD json for training. E.g., train-v1.1.json")
-    parser.add_argument("--predict_file", default="EKMRC/data/ReCoRD/dev.json", type=str,
-                        help="SQuAD json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
+    parser.add_argument("--train_file", default="EKMRC/data/ReCoRD_base/train.json", type=str,
+                        help="ReCoRD json for training. E.g., train.json")
+    parser.add_argument("--predict_file", default="EKMRC/data/ReCoRD_base/dev.json", type=str,
+                        help="ReCoRD json for predictions. E.g., dev.json or test.json")
     parser.add_argument("--model_type", default="bert", type=str,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str,
                         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
-    parser.add_argument("--output_dir", default="tmp/debug_record/", type=str,
+    parser.add_argument("--output_dir", default="EKMRC/results/pure_record/", type=str,
                         help="The output directory where the model checkpoints and predictions will be written.")
     
-
     ## log data path
     # parser.add_argument("--save_log_dir", default="EKMRC/log_dir", type=str, help="saved log dir")
     parser.add_argument("--log_comment", default="BERT", type=str, help="log file comment")
@@ -394,7 +400,7 @@ def main():
                              "be truncated to this length.")
     parser.add_argument("--do_train", action='store_true', default=False,
                         help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true', default=True,
+    parser.add_argument("--do_eval", action='store_true', default=False,
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--evaluate_during_training", action='store_true',
                         help="Rul evaluation during training at each logging step.")
@@ -432,8 +438,7 @@ def main():
 
     parser.add_argument('--logging_steps', type=int, default=4275,
                         help="Log every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=4275,
-                        help="Save checkpoint every X updates steps.")
+    
     parser.add_argument("--eval_all_checkpoints", action='store_true',
                         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
@@ -554,6 +559,7 @@ def main():
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
+        # evaluate all the checkpoint of the 'args.output_dir'
         if args.eval_all_checkpoints:
             checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
@@ -565,8 +571,9 @@ def main():
             logger.info("checkponit path {}".format(checkpoint))
 
         for checkpoint in checkpoints:
-            # pass the last one
+            # pass the invalid checkpoint path
             if "checkpoint" not in checkpoint:
+                logger.info("pass the invalid checkpoint: {}".format(checkpoint))
                 continue
             # Reload the model
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""

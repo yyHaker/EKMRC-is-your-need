@@ -63,7 +63,7 @@ if is_torch_available():
     from .modeling_auto import (AutoModel, AutoModelForSequenceClassification, AutoModelForQuestionAnswering,
                                 AutoModelWithLMHead)
 
-    from .modeling_bert import (KTNetForQuestionAnswering, KTNetForQuestionAnswering_both, BertPreTrainedModel, BertModel, BertForPreTraining,
+    from .modeling_bert import (FSNet_ner_ForQuestionAnswering,FSNetForQuestionAnswering, KTNetForQuestionAnswering_both, BertPreTrainedModel, BertModel, BertForPreTraining,
                                 SKGNetForQuestionAnswering,
                                 BertForMaskedLM, BertForNextSentencePrediction,
                                 BertForSequenceClassification, BertForMultipleChoice,

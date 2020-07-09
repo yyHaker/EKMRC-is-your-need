@@ -23,6 +23,8 @@ sys.path.append(".")
 import argparse
 import logging
 import os
+# os.environ['CUDA_VISIBLE_DEVICES']='0'
+
 import random
 import glob
 import timeit
@@ -43,7 +45,7 @@ except:
 from tqdm import tqdm, trange
 
 from transformers import (WEIGHTS_NAME, BertConfig,
-                                  KTNetForQuestionAnswering,
+                                  FSNetForQuestionAnswering,
                                   BertForQuestionAnswering, BertTokenizer,
                                   XLMConfig, XLMForQuestionAnswering,
                                   XLMTokenizer, XLNetConfig,
@@ -68,7 +70,7 @@ ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) \
                   for conf in (BertConfig, XLNetConfig, XLMConfig)), ())
 
 MODEL_CLASSES = {
-    'ktnet': (BertConfig, KTNetForQuestionAnswering, BertTokenizer),
+    'fsnet': (BertConfig, FSNetForQuestionAnswering, BertTokenizer),
     'bert': (BertConfig, BertForQuestionAnswering, BertTokenizer),
     'xlnet': (XLNetConfig, XLNetForQuestionAnswering, XLNetTokenizer),
     'xlm': (XLMConfig, XLMForQuestionAnswering, XLMTokenizer),
@@ -149,6 +151,9 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    args.logging_steps = t_total // args.num_train_epochs
+    logger.info("  Logging steps = %d", args.logging_steps)
+
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad() 
@@ -163,7 +168,8 @@ def train(args, train_dataset, model, tokenizer):
                       'attention_mask':  batch[1],
                       'start_positions': batch[3],
                       'end_positions':   batch[4],
-                      'concept_ids': batch[7]}
+                      'concept_ids': batch[7],
+                      'concept_masks': batch[8]}
             if args.model_type != 'distilbert':
                 inputs['token_type_ids'] = None if args.model_type == 'xlm' else batch[2]
             if args.model_type in ['xlnet', 'xlm']:
@@ -195,6 +201,7 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
@@ -205,7 +212,7 @@ def train(args, train_dataset, model, tokenizer):
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
@@ -251,7 +258,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         with torch.no_grad():
             inputs = {'input_ids':      batch[0],
                       'attention_mask': batch[1],
-                      'concept_ids': batch[6]
+                      'concept_ids': batch[6],
+                      'concept_masks': batch[7]
                       }
             if args.model_type != 'distilbert':
                 inputs['token_type_ids'] = None if args.model_type == 'xlm' else batch[2]  # XLM don't use segment_ids
@@ -320,7 +328,7 @@ def read_concept_embedding(embedding_path):
     n_concept = len(info)
     embedding_mat = []
     id2concept, concept2id = [], {}
-    # add padding concept into vocab
+    # add padding concept into vocab, id 0 represent no concept
     id2concept.append('<pad_concept>')
     concept2id['<pad_concept>'] = 0
     embedding_mat.append([0.0 for _ in range(dim)])
@@ -342,11 +350,11 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     # load concept embedding mat(only support add one kind concept)
     # here one of wordnet and nell must be used
     if args.use_wordnet:
-        logger.info("load wordnet embeddings....")
-        id2concept, concept2id, embedding_mat = read_concept_embedding("EKMRC/data/retrived_kb_data/kb_embeddings/wn_concept2vec.txt")
+        logger.info("load wordnet embeddings....")  # EKMRC/kgs/wordnet/wordnet_emb/wn_concept2vec.txt
+        id2concept, concept2id, embedding_mat = read_concept_embedding(args.embedding_path)
     elif args.use_nell:
         logger.info("load nell embeddings....")
-        id2concept, concept2id, embedding_mat = read_concept_embedding("EKMRC/data/retrived_kb_data/kb_embeddings/nell_concept2vec.txt")
+        id2concept, concept2id, embedding_mat = read_concept_embedding(args.embedding_path)
 
     # Load data features from cache or dataset file
     input_file = args.predict_file if evaluate else args.train_file
@@ -354,11 +362,15 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 
     # change the cache name according to the args.model_name_or_path
     cache_name = list(filter(None, args.model_name_or_path.split('/'))).pop()
+
+    # do some special mapping debug_fsnet_bert_large_uncased_wwm_stage1_lr3e-4
     if "stage1" in cache_name:
-        if "ktnet" in cache_name and "large" in cache_name:
-            cache_name = "bert-large-cased"
-        elif "ktnet" in cache_name and "base" in cahce_name:
-            cache_name = "bert-base-cased"
+        if "bert_large_uncased_wwm" in cache_name:
+            cache_name = "bert-large-uncased-whole-word-masking"
+        elif "bert_large_uncased" in cache_name:
+            cache_name = "bert_large_uncased"
+        else:
+            pass
 
     cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_{}_{}_{}_{}'.format(
         'dev' if evaluate else 'train',
@@ -366,15 +378,21 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         cpnet_name,
         str(args.max_seq_length)))
     
-    if os.path.exists(cached_features_file) and not args.overwrite_cache and not output_examples:
+    if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
+        if output_examples:
+            examples = read_record_examples(input_file=input_file,
+                                                is_training=not evaluate,
+                                                version_2_with_negative=args.version_2_with_negative)
     else:
         logger.info("Creating features from dataset file at %s", input_file)
         examples = read_record_examples(input_file=input_file,
                                                 is_training=not evaluate,
                                                 version_2_with_negative=args.version_2_with_negative)
-        
+        # # debug here
+        # examples = examples[: 10]
+
         features = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 max_seq_length=args.max_seq_length,
@@ -404,18 +422,21 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
     all_cls_index = torch.tensor([f.cls_index for f in features], dtype=torch.long)
     all_p_mask = torch.tensor([f.p_mask for f in features], dtype=torch.float)
+
     ## concept ids here
     all_concept_ids = torch.tensor([f.concept_ids for f in features], dtype=torch.long)
+    all_concept_masks = torch.tensor([f.concept_masks for f in features], dtype=torch.long)
+
     if evaluate:
         all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
         dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                                all_example_index, all_cls_index, all_p_mask, all_concept_ids)
+                                all_example_index, all_cls_index, all_p_mask, all_concept_ids, all_concept_masks)
     else:
         all_start_positions = torch.tensor([f.start_position for f in features], dtype=torch.long)
         all_end_positions = torch.tensor([f.end_position for f in features], dtype=torch.long)
         dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
                                 all_start_positions, all_end_positions,
-                                all_cls_index, all_p_mask, all_concept_ids)
+                                all_cls_index, all_p_mask, all_concept_ids, all_concept_masks)
 
     if output_examples:
         return dataset, examples, features
@@ -426,14 +447,12 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
 def main():
     parser = argparse.ArgumentParser()
 
-    # os.environ['CUDA_VISIBLE_DEVICES']='0'
-
     ## Required parameters
-    parser.add_argument("--train_file", default="EKMRC/data/ReCoRD/train.json", type=str,
+    parser.add_argument("--train_file", default="EKMRC/data/ReCoRD_debug/train.json", type=str,
                         help="SQuAD json for training. E.g., train-v1.1.json")
-    parser.add_argument("--predict_file", default="EKMRC/data/ReCoRD/dev.json", type=str,
+    parser.add_argument("--predict_file", default="EKMRC/data/ReCoRD_debug/dev.json", type=str,
                         help="SQuAD json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
-    parser.add_argument("--model_type", default="ktnet", type=str,
+    parser.add_argument("--model_type", default="fsnet", type=str,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str,
                         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
@@ -441,22 +460,24 @@ def main():
                         help="The output directory where the model checkpoints and predictions will be written.")
 
     # for concept params
-    parser.add_argument("--embedding_path", default="EKMRC/data/retrived_kb_data/kb_embeddings/nell_concept2vec.txt", type=str,
+    parser.add_argument("--embedding_path", default="EKMRC/kgs/NELL/nell_emb/nell_concept2vec.txt", type=str,
                         help="the pretrained concept embedding path")
-    parser.add_argument("--retrieved_nell_concept_path", default="EKMRC/data/retrived_kb_data/nell_record_self", type=str,
+    parser.add_argument("--retrieved_nell_concept_path", default="EKMRC/kgs/NELL/retrieve_nell_res/bert-large-uncased-wwm/", type=str,
                         help="retrievedd nell concept path")
-    parser.add_argument("--retrieved_wordnet_concept_path", default="EKMRC/data/retrived_kb_data/wordnet_record", type=str,
+    parser.add_argument("--retrieved_wordnet_concept_path", default="EKMRC/kgs/wordnet/retrieve_wordnet_res", type=str,
                         help="retrieved wordnet concept path")
     parser.add_argument("--use_wordnet", action='store_true', help="if use wordnet")
     parser.add_argument("--use_nell", action='store_true', help="is use nell")
+
+    parser.add_argument("--freeze_concept", action='store_true', help="if freeze concept here")
     
     # data path
-    parser.add_argument("--tokenization_path", default="EKMRC/data/ReCoRD_tokenization/tokens_self", type=str,
+    parser.add_argument("--tokenization_path", default="EKMRC/data/ReCoRD/tokenization_self/bert-large-uncased-wwm", type=str,
                         help="tokenization path")
     
     # log data path（use default dir runs）
     # parser.add_argument("--save_log_dir", default="EKMRC/log_dir", type=str, help="saved log dir")
-    parser.add_argument("--log_comment", default="ktnet", type=str, help="log file comment")
+    parser.add_argument("--log_comment", default="fsnet", type=str, help="log file comment")
 
     ## Other parameters
     parser.add_argument("--config_name", default="", type=str,
@@ -479,7 +500,7 @@ def main():
     parser.add_argument("--max_query_length", default=64, type=int,
                         help="The maximum number of tokens for the question. Questions longer than this will "
                              "be truncated to this length.")
-    parser.add_argument("--do_train", action='store_true', default=False,
+    parser.add_argument("--do_train", action='store_true', default=True,
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', default=False,
                         help="Whether to run eval on the dev set.")
@@ -490,9 +511,9 @@ def main():
     
     parser.add_argument("--scheduler", default="linear", type=str, help="optimization scheduler")
 
-    parser.add_argument("--per_gpu_train_batch_size", default=4, type=int,
+    parser.add_argument("--per_gpu_train_batch_size", default=1, type=int,
                         help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--per_gpu_eval_batch_size", default=4, type=int,
+    parser.add_argument("--per_gpu_eval_batch_size", default=1, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
     parser.add_argument("--learning_rate", default=3e-5, type=float,
                         help="The initial learning rate for Adam.")
@@ -523,8 +544,6 @@ def main():
 
     parser.add_argument('--logging_steps', type=int, default=4275,
                         help="Log every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=4275,
-                        help="Save checkpoint every X updates steps.")
     parser.add_argument("--eval_all_checkpoints", action='store_true',
                         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
@@ -601,6 +620,7 @@ def main():
                                         from_tf=bool('.ckpt' in args.model_name_or_path),
                                         config=config,
                                         cache_dir=args.cache_dir if args.cache_dir else None,
+                                        args=args,
                                         concept_embedding_mat=concept_embedding_mat)
 
     if args.local_rank == 0:
@@ -644,7 +664,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
 
         # Load a trained model and vocabulary that you have fine-tuned
-        model = model_class.from_pretrained(args.output_dir, concept_embedding_mat=concept_embedding_mat)
+        model = model_class.from_pretrained(args.output_dir, args=args, concept_embedding_mat=concept_embedding_mat)
         tokenizer = tokenizer_class.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
 
@@ -669,7 +689,7 @@ def main():
                 continue
             # Reload the model
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
-            model = model_class.from_pretrained(checkpoint, concept_embedding_mat=concept_embedding_mat)
+            model = model_class.from_pretrained(checkpoint, args=args, concept_embedding_mat=concept_embedding_mat)
             model.to(args.device)
 
             logger.info("Evaluating......")

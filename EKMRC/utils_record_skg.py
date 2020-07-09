@@ -866,10 +866,10 @@ def convert_examples_to_features(index,
             unique_id += 1
     
     # save features to file
-    with open(os.path.join(example_cache_dir, 'examples_part_{}.data'.format(index)), 'wb') as fout:
-        pickle.dump(features, fout)
-    logger.info("finished dump features to examples_part_{}.data".format(index))
-    # return features
+    # with open(os.path.join(example_cache_dir, 'examples_part_{}.data'.format(index)), 'wb') as fout:
+    #     pickle.dump(features, fout)
+    # logger.info("finished dump features to examples_part_{}.data".format(index))
+    return features
 
 
 '''for search related concepts(two concepts) here'''

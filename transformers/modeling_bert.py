@@ -1193,7 +1193,7 @@ class BertForTokenClassification(BertPreTrainedModel):
             loss_fct = CrossEntropyLoss()
             # Only keep active parts of the loss
             if attention_mask is not None:
-                active_loss = attention_mask.view(-1) == 1
+                active_loss = attention_mask.view(-1) == 1 # [batch_size * seq_len]
                 active_logits = logits.view(-1, self.num_labels)[active_loss]
                 active_labels = labels.view(-1)[active_loss]
                 loss = loss_fct(active_logits, active_labels)
@@ -1298,7 +1298,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
 ###############################################################################################################################################
 # below is authored by yyhaker
-class KTNetForQuestionAnswering(BertPreTrainedModel):
+class FSNetForQuestionAnswering(BertPreTrainedModel):
     r"""
         **start_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
@@ -1337,21 +1337,21 @@ class KTNetForQuestionAnswering(BertPreTrainedModel):
         print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
         # a nice puppet
     """
-    def __init__(self, config, concept_embedding_mat):
-        super(KTNetForQuestionAnswering, self).__init__(config, concept_embedding_mat)
+    def __init__(self, config, args, concept_embedding_mat):
+        super(FSNetForQuestionAnswering, self).__init__(config, args, concept_embedding_mat)
         self.num_labels = config.num_labels
         
         '''1st Layer: BERT Encoding Layer'''
         self.bert = BertModel(config)
 
         '''2st Layer: Knowledge Integration Layer'''
-        self.memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(concept_embedding_mat), freeze=True)
+        self.memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(concept_embedding_mat), freeze=args.freeze_concept)
 
         concept_vocab_size = concept_embedding_mat.shape[0]
         concept_dim = concept_embedding_mat.shape[1]
 
         # init a sentinel vector
-        self.sentinel_vec = torch.nn.Parameter(torch.rand(concept_dim), requires_grad=False)
+        # self.sentinel_vec = torch.nn.Parameter(torch.rand(concept_dim), requires_grad=False)
 
         # init a sentinel vector
         # elf.sentinel_vec = torch.nn.Parameter(torch.zeros(concept_dim), requires_grad=True)
@@ -1393,7 +1393,7 @@ class KTNetForQuestionAnswering(BertPreTrainedModel):
 
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
-                start_positions=None, end_positions=None, concept_ids=None):
+                start_positions=None, end_positions=None, concept_ids=None, concept_masks=None):
         
         '''1st Layer: Bert Layer'''
         outputs = self.bert(input_ids,
@@ -1412,19 +1412,22 @@ class KTNetForQuestionAnswering(BertPreTrainedModel):
         cpnet_dim = concept_emb.size()[3]
         
         # add sentinel vector
-        sentinel_vec = self.sentinel_vec.to(concept_emb.device)
-        sentinel_vec_expand = sentinel_vec.expand(batch_size, seq_length, cpnet_dim).unsqueeze(2).contiguous()  # [batch_size, seq_length, 1, cpnet_dim]
+        # sentinel_vec = self.sentinel_vec.to(concept_emb.device)
+        # sentinel_vec_expand = sentinel_vec.expand(batch_size, seq_length, cpnet_dim).unsqueeze(2).contiguous()  # [batch_size, seq_length, 1, cpnet_dim]
         
-        concept_emb_add = torch.cat((concept_emb, sentinel_vec_expand), 2)  # [batch_size, seq_length, num_concepts + 1, cpnet_dim]
+        # concept_emb_add = torch.cat((concept_emb, sentinel_vec_expand), 2)  # [batch_size, seq_length, num_concepts + 1, cpnet_dim]
 
-        sequence_output_expand = sequence_output.unsqueeze(2).expand(batch_size, seq_length, num_concepts + 1, hidden_size).contiguous() # [batch_size, seq_length, num_concepts + 1, hidden_size]
+        sequence_output_expand = sequence_output.unsqueeze(2).expand(
+            batch_size, seq_length, num_concepts, hidden_size).contiguous() # [batch_size, seq_length, num_concepts, hidden_size]
 
-        similarity_weight = self.relavance_layer(sequence_output_expand, concept_emb_add).squeeze(-1) # [batch_size, seq_length, num_concepts + 1]
+        similarity_weight = self.relavance_layer(sequence_output_expand, concept_emb).squeeze(-1) # [batch_size, seq_length, num_concepts]
         
-        similarity_weight_softmax = torch.nn.functional.softmax(similarity_weight, -1)
+        # calc masked attention
+        similarity_weight = INF * (concept_masks - 1.0) + similarity_weight
+        similarity_weight_softmax = torch.nn.functional.softmax(similarity_weight, -1) # [batch_size, seq_length, num_concepts]
 
         concept_relavance = torch.bmm(similarity_weight_softmax.unsqueeze(2).reshape(batch_size * seq_length, 1, -1),
-            concept_emb_add.reshape(batch_size*seq_length, num_concepts + 1, -1))  # [batch_size * seq_length, 1, cpnet_dim]
+            concept_emb.reshape(batch_size * seq_length, num_concepts, -1))  # [batch_size * seq_length, 1, cpnet_dim]
         concept_relavance = concept_relavance.squeeze(1).reshape(batch_size, seq_length, -1) # [batch_size, seq_length, cpnet_dim]
         
         # mask and cat representation
@@ -1463,6 +1466,194 @@ class KTNetForQuestionAnswering(BertPreTrainedModel):
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+# here is FSNET_ner for QA
+class FSNet_ner_ForQuestionAnswering(BertPreTrainedModel):
+    r"""
+        **start_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+        **end_positions**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`).
+            Position outside of the sequence are not taken into account for computing the loss.
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **loss**: (`optional`, returned when ``labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Total span extraction loss is the sum of a Cross-Entropy for the start and end positions.
+        **start_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-start scores (before SoftMax).
+        **end_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length,)``
+            Span-end scores (before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+        question, text = "Who was Jim Henson?", "Jim Henson was a nice puppet"
+        input_text = "[CLS] " + question + " [SEP] " + text + " [SEP]"
+        input_ids = tokenizer.encode(input_text)
+        token_type_ids = [0 if i <= input_ids.index(102) else 1 for i in range(len(input_ids))] 
+        start_scores, end_scores = model(torch.tensor([input_ids]), token_type_ids=torch.tensor([token_type_ids]))
+        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)  
+        print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
+        # a nice puppet
+    """
+    def __init__(self, config, args, concept_embedding_mat):
+        super(FSNet_ner_ForQuestionAnswering, self).__init__(config, args, concept_embedding_mat)
+        self.num_labels = config.num_labels
+        
+        '''1st Layer: BERT Encoding Layer'''
+        self.bert = BertModel(config)
+
+        '''2st Layer: Knowledge Integration Layer'''
+        self.memory_embs = torch.nn.Embedding.from_pretrained(torch.Tensor(concept_embedding_mat), freeze=args.freeze_concept)
+
+        concept_vocab_size = concept_embedding_mat.shape[0]
+        concept_dim = concept_embedding_mat.shape[1]
+
+        self.relavance_layer = torch.nn.Bilinear(config.hidden_size, concept_dim, 1)
+
+        self.trilinear = torch.nn.Linear(3 * (config.hidden_size + concept_dim), 1)
+
+        self.qa_outputs = torch.nn.Linear(6 * (config.hidden_size + concept_dim), config.num_labels)
+
+        # for Named Entity task
+        self.tag_num_labels = 4
+        self.classifier = nn.Linear(config.hidden_size, self.tag_num_labels)
+
+        self.init_weights()
+    
+    def self_matching(self, U, mask):
+        '''self-matching layer.
+            U, (b, len, d)
+            mask, (b, len)
+        '''
+        b, len_, d = U.size()
+
+        # direct info interaction
+        ui = U.unsqueeze(2) # [b, len, 1, d]
+        uj = U.unsqueeze(1) # [b, 1, len, d]
+        dot = ui * uj  # [b, len, len, d]
+        ui_expand = ui.expand(b, len_, len_, d).contiguous() # [b, len, len, d] 
+        uj_expand = uj.expand(b, len_, len_, d).contiguous() # [b, len, len, d]
+        R = self.trilinear(torch.cat((ui_expand, uj_expand, dot), -1)).squeeze(-1) # [b, len, len, 3 * d] -> [b, len, len, 1] -> [b, len, len]
+        mask_expand = mask.unsqueeze(-1).expand(b, len_, len_).contiguous() # [b, len, len]
+        R = INF * (mask_expand.float() - 1.0) + R   # mask here
+        A = torch.nn.functional.softmax(R, -1) # [b, len, len]
+        V = torch.bmm(A, U) # [b, len, d]
+
+        # indirect info interaction
+        A_hat = torch.bmm(A, A)  # [b, len, len]
+        V_hat = torch.bmm(A_hat, U) # [b, len, d]
+        O = torch.cat((U, V, U - V, U * V, V_hat, U - V_hat), -1) # [b, len, 6*d]
+        return O
+
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
+                start_positions=None, end_positions=None, concept_ids=None, concept_masks=None, labels_ids=None):
+        
+        '''1st Layer: Bert Layer'''
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds)
+
+        sequence_output = outputs[0] # [batch_size, seq_length, hidden_size]
+        batch_size, seq_length, hidden_size = sequence_output.size()
+
+        # here has two tasks: (1) Name Entity recognition (2) knowledge Enhanced QA
+        # task (1) below
+
+        # sequence_output_for_tag = self.dropout(sequence_output)
+        logits_tag = self.classifier(sequence_output)
+        if labels_ids is not None:
+            loss_fct = CrossEntropyLoss()
+            # Only keep active parts of the loss
+            if attention_mask is not None:
+                active_loss = attention_mask.view(-1) == 1 # [batch_size * seq_len]
+                active_logits = logits_tag.view(-1, self.tag_num_labels)[active_loss]
+                active_labels = labels_ids.view(-1)[active_loss]
+                tag_loss = loss_fct(active_logits, active_labels)
+            else:
+                tag_loss = loss_fct(logits_tag.view(-1, self.tag_num_labels), labels_ids.view(-1))
+
+        # task (2) below
+
+        '''2nd Layer: Knowledge Integration Layer'''
+        concept_emb = self.memory_embs(concept_ids) # [batch_size, seq_length, num_concepts, cpnet_dim]
+        num_concepts = concept_emb.size()[2]
+        cpnet_dim = concept_emb.size()[3]
+        
+        # add sentinel vector
+        # sentinel_vec = self.sentinel_vec.to(concept_emb.device)
+        # sentinel_vec_expand = sentinel_vec.expand(batch_size, seq_length, cpnet_dim).unsqueeze(2).contiguous()  # [batch_size, seq_length, 1, cpnet_dim]
+        
+        # concept_emb_add = torch.cat((concept_emb, sentinel_vec_expand), 2)  # [batch_size, seq_length, num_concepts + 1, cpnet_dim]
+
+        sequence_output_expand = sequence_output.unsqueeze(2).expand(
+            batch_size, seq_length, num_concepts, hidden_size).contiguous() # [batch_size, seq_length, num_concepts, hidden_size]
+
+        similarity_weight = self.relavance_layer(sequence_output_expand, concept_emb).squeeze(-1) # [batch_size, seq_length, num_concepts]
+        
+        # calc masked attention
+        similarity_weight = INF * (concept_masks - 1.0) + similarity_weight
+        similarity_weight_softmax = torch.nn.functional.softmax(similarity_weight, -1) # [batch_size, seq_length, num_concepts]
+
+        concept_relavance = torch.bmm(similarity_weight_softmax.unsqueeze(2).reshape(batch_size * seq_length, 1, -1),
+            concept_emb.reshape(batch_size * seq_length, num_concepts, -1))  # [batch_size * seq_length, 1, cpnet_dim]
+        concept_relavance = concept_relavance.squeeze(1).reshape(batch_size, seq_length, -1) # [batch_size, seq_length, cpnet_dim]
+        
+        # mask and cat representation
+        attention_mask_expand = attention_mask.unsqueeze(-1).expand(batch_size, seq_length, cpnet_dim).contiguous() # [batch_size, seq_length, cpnet_dim]
+        concept_relavance = attention_mask_expand.float() * concept_relavance
+        sequence_kg_output = torch.cat((sequence_output, concept_relavance), dim=-1) # [batch_size, seq_length, hidden_size + cpnet_dim]
+
+        '''3nd Layer: Self-Matching Layer'''
+        sequence_kg_output = self.self_matching(sequence_kg_output, attention_mask)
+
+        # residule connection
+        # sequence_kg_output = torch.cat((sequence_output, sequence_kg_output), dim=-1)
+
+        '''4nd Layer: Output Layer'''
+        logits = self.qa_outputs(sequence_kg_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1)
+        end_logits = end_logits.squeeze(-1)
+
+        outputs = (start_logits, end_logits,) + outputs[2:]
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1)
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1)
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions.clamp_(0, ignored_index)
+            end_positions.clamp_(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+            # add multi-task loss
+            total_loss += tag_loss
+            outputs = (total_loss,) + outputs
+
+        return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
 
 # here KT-NET support (wordnet and nell)
 class KTNetForQuestionAnswering_both(BertPreTrainedModel):
@@ -1689,10 +1880,11 @@ class SKGNetForQuestionAnswering(BertPreTrainedModel):
         print(' '.join(all_tokens[torch.argmax(start_scores) : torch.argmax(end_scores)+1]))
         # a nice puppet
     """
-    def __init__(self, config, device, entity_emb_mat, relation_emb_mat):
-        super(SKGNetForQuestionAnswering, self).__init__(config, device, entity_emb_mat, relation_emb_mat)
+    def __init__(self, config, device, args, entity_emb_mat, relation_emb_mat):
+        super(SKGNetForQuestionAnswering, self).__init__(config, device, args, entity_emb_mat, relation_emb_mat)
         self.num_labels = config.num_labels
         self.device = device
+        self.gnn_layers = args.gnn_layers
         
         '''1st Layer: BERT Encoding Layer'''
         self.bert = BertModel(config)
@@ -1705,9 +1897,11 @@ class SKGNetForQuestionAnswering(BertPreTrainedModel):
 
         '''3st Layer: Graph Attention Layer'''
         self.conv = GATConv(concept_dim, concept_dim, heads=8, dropout=config.hidden_dropout_prob)
+        self.reflect_layer = torch.nn.Linear(8 * concept_dim, config.hidden_size)
 
         '''4st Layer: Output Layer'''
-        self.qa_outputs = torch.nn.Linear(config.hidden_size + 8 * concept_dim, config.num_labels)
+        self.gate_layer = torch.nn.Linear(config.hidden_size * 2, 1)
+        self.qa_outputs = torch.nn.Linear(config.hidden_size, config.num_labels)
 
         # self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 
@@ -1793,8 +1987,14 @@ class SKGNetForQuestionAnswering(BertPreTrainedModel):
             graph = Data(x=nodes_features_i, edge_index=edges_index_i, edge_attr=edges_attr_i).to(self.device)
             graph_list.append(graph)
         graph_batch = Batch.from_data_list(graph_list)
-
-        out = self.conv(graph_batch.x, graph_batch.edge_index)
+        
+        '''3nd Layer: Graph Attention Layer'''
+        out = graph_batch.x
+        edge_emb = graph_batch.edge_attr
+        # out = self.conv(graph_batch.x, graph_batch.edge_index)
+        for i in range(self.gnn_layers):
+            out = self.conv(out, graph_batch.edge_index, edge_emb)
+        
         out_dim = out.size()[-1]
         out = out.reshape(batch_size, -1, out_dim)    # [batch_size, num_nodes, node_features]
 
@@ -1807,9 +2007,10 @@ class SKGNetForQuestionAnswering(BertPreTrainedModel):
         # core_entity_embs = torch.tensor(core_entity_emb_list).to(self.device) 
 
         # concat bert output and kg output
-        sequence_kg_output = torch.cat((sequence_output, core_entity_embs), dim=-1)
+        kg_emb_output = self.reflect_layer(core_entity_embs)
+        gate_W = torch.sigmoid(self.gate_layer(torch.cat((sequence_output, kg_emb_output), dim=-1)))
+        sequence_kg_output = gate_W * sequence_output + (1 - gate_W) * kg_emb_output
 
-        '''3nd Layer: Graph Attention Layer'''
 
         '''4nd Layer: Output Layer'''
         logits = self.qa_outputs(sequence_kg_output)
@@ -1885,9 +2086,14 @@ class GATConv(MessagePassing):
         self.negative_slope = negative_slope
         self.dropout = dropout
 
-        self.weight = Parameter(torch.Tensor(in_channels,
+        self.weight_h = Parameter(torch.Tensor(in_channels,
                                              heads * out_channels))
-        self.att = Parameter(torch.Tensor(1, heads, 2 * out_channels))
+        self.weight_t = Parameter(torch.Tensor(in_channels,
+                                             heads * out_channels))
+        self.weight_r = Parameter(torch.Tensor(in_channels,
+                                             heads * out_channels))
+        
+        self.att = Parameter(torch.Tensor(1, heads, out_channels))
 
         if bias and concat:
             self.bias = Parameter(torch.Tensor(heads * out_channels))
@@ -1899,36 +2105,50 @@ class GATConv(MessagePassing):
         self.reset_parameters()
 
     def reset_parameters(self):
-        glorot(self.weight)
+        glorot(self.weight_h)
+        glorot(self.weight_t)
+        glorot(self.weight_r)
         glorot(self.att)
         zeros(self.bias)
 
-    def forward(self, x, edge_index, size=None):
+    def forward(self, x, edge_index, edge_attr):
         """"""
-        if size is None and torch.is_tensor(x):
-            edge_index, _ = remove_self_loops(edge_index)
-            edge_index, _ = add_self_loops(edge_index,
-                                           num_nodes=x.size(self.node_dim))
+        # x : [N, in_channels]
+        # edge_index: [2, E]
+        # edge_attr: [E, attr_dim]
+        
+        # if torch.is_tensor(x):
+        #     edge_index, _ = remove_self_loops(edge_index)
+        #     edge_index, _ = add_self_loops(edge_index,
+        #                                    num_nodes=x.size(self.node_dim))
 
-        if torch.is_tensor(x):
-            x = torch.matmul(x, self.weight)
-        else:
-            x = (None if x[0] is None else torch.matmul(x[0], self.weight),
-                 None if x[1] is None else torch.matmul(x[1], self.weight))
+        # edge feature
+        edge_attr = edge_attr.unsqueeze(-1) if edge_attr.dim() == 1 else edge_attr
 
-        return self.propagate(edge_index, size=size, x=x)
+        # if torch.is_tensor(x):
+        #     x = torch.matmul(x, self.weight)
+        # else:
+        #     x = (None if x[0] is None else torch.matmul(x[0], self.weight),
+        #          None if x[1] is None else torch.matmul(x[1], self.weight))
 
-    def message(self, edge_index_i, x_i, x_j, size_i):
+        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
+
+    def message(self, edge_index_i, x_i, x_j, edge_attr):
         # Compute attention coefficients.
-        x_j = x_j.view(-1, self.heads, self.out_channels)
-        if x_i is None:
-            alpha = (x_j * self.att[:, :, self.out_channels:]).sum(dim=-1)
-        else:
-            x_i = x_i.view(-1, self.heads, self.out_channels)
-            alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+        x_i = torch.matmul(x_i, self.weight_t) # [N, num_head * out_channels]
+        x_j = torch.matmul(x_j, self.weight_h) # [N, num_head * out_channels]
+        e_ij = torch.matmul(edge_attr, self.weight_r) # [N, num_head * out_channels]
 
-        alpha = F.leaky_relu(alpha, self.negative_slope)
-        alpha = softmax(alpha, edge_index_i, size_i)
+        x_i = x_i.view(-1, self.heads, self.out_channels)   # [N, num_heads, out_channels]
+        x_j = x_j.view(-1, self.heads, self.out_channels)   # [N, num_heads, out_channels]
+        e_ij = e_ij.view(-1, self.heads, self.out_channels) # [N, num_heads, out_channels]
+
+        # alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+
+        alpha = ((e_ij * F.leaky_relu(x_i + x_j, self.negative_slope)) * self.att).sum(-1)  # [N, num_heads]
+
+        # alpha = F.leaky_relu(alpha, self.negative_slope)
+        alpha = softmax(alpha, edge_index_i)
 
         # Sample attention coefficients stochastically.
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)

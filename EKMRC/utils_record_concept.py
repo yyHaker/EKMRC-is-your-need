@@ -89,6 +89,7 @@ class InputFeatures(object):
                  input_mask,
                  segment_ids,
                  concept_ids,
+                 concept_masks,
                  cls_index,
                  p_mask,
                  paragraph_len,
@@ -105,6 +106,7 @@ class InputFeatures(object):
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.concept_ids = concept_ids
+        self.concept_masks = concept_masks
         self.cls_index = cls_index
         self.p_mask = p_mask
         self.paragraph_len = paragraph_len
@@ -335,9 +337,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     '''load ReCoRD tokenization info'''
     all_tokenization_info = {}
     if is_training:
-        tokenization_path = os.path.join(tokenization_path, "train.tokenization.cased.data")
+        tokenization_path = os.path.join(tokenization_path, "train.tokenization.uncased.data")
     else:
-        tokenization_path = os.path.join(tokenization_path, "dev.tokenization.cased.data")
+        tokenization_path = os.path.join(tokenization_path, "dev.tokenization.uncased.data")
     assert tokenization_path is not None
     for item in pickle.load(open(tokenization_path, 'rb')):
         all_tokenization_info[item['id']] = item
@@ -369,7 +371,9 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             retrieve_concept_info[item['id']] = item
         max_concept_length = max([max([len(entity_info['retrieved_concepts']) for entity_info in item['query_entities'] + item['document_entities']]) 
                                         for qid, item in retrieve_concept_info.items() if len(item['query_entities'] + item['document_entities']) > 0])
-    
+    # add sentinel id
+    max_concept_length = max_concept_length + 1
+
     assert concept2id is not None
 
     '''return list of concept ids given input subword list'''
@@ -507,6 +511,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             token_to_orig_map = {}
             token_is_max_context = {}
             segment_ids = []
+            # concept ids and mask
             concept_ids = []
 
             # p_mask: mask with 1 for token than cannot be in the answer (0 for token which can be in an answer)
@@ -592,19 +597,30 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                 segment_ids.append(pad_token_segment_id)
                 p_mask.append(1)
 
-            # for concept to pad
-            # here zero represents no concept
+            # padding concept ids and get concept masks
+            # here id 0 represents no concept, padding use 0
+            concept_masks = []
             for cindex in range(len(concept_ids)):
-                concept_ids[cindex] = concept_ids[cindex] + [0] * (max_concept_length - len(concept_ids[cindex]))
-                concept_ids[cindex] = concept_ids[cindex][: max_concept_length]
+                cur_concept_ids = concept_ids[cindex]
+                cur_concept_ids = [0] + cur_concept_ids  # add sentinel id here, represent no concept
+                cur_concept_len = len(cur_concept_ids)
+                # get concept mask
+                cur_concept_mask = [1] * cur_concept_len + [0] * (max_concept_length - cur_concept_len)
+                concept_masks.append(cur_concept_mask)
+                # padding concept ids
+                cur_concept_ids = cur_concept_ids + [0] * (max_concept_length - cur_concept_len)
+                concept_ids[cindex] = cur_concept_ids
+
             if len(concept_ids) < max_seq_length:
                 for _ in range(max_seq_length - len(concept_ids)):
                     concept_ids.append([0] * max_concept_length)
+                    concept_masks.append([0] * max_concept_length)
             
             assert len(input_ids) == max_seq_length
             assert len(input_mask) == max_seq_length
             assert len(segment_ids) == max_seq_length
             assert len(concept_ids) == max_seq_length
+            assert len(concept_masks) == max_seq_length
 
             span_is_impossible = example.is_impossible
             start_position = None
@@ -634,31 +650,31 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                 start_position = cls_index
                 end_position = cls_index
 
-            if example_index < 2:
-                logger.info("*** Example ***")
-                logger.info("unique_id: %s" % (unique_id))
-                logger.info("example_index: %s" % (example_index))
-                logger.info("doc_span_index: %s" % (doc_span_index))
-                logger.info("tokens: %s" % " ".join(tokens))
-                logger.info("token_to_orig_map: %s" % " ".join([
-                    "%d:%d" % (x, y) for (x, y) in token_to_orig_map.items()]))
-                logger.info("token_is_max_context: %s" % " ".join([
-                    "%d:%s" % (x, y) for (x, y) in token_is_max_context.items()
-                ]))
-                logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-                logger.info(
-                    "input_mask: %s" % " ".join([str(x) for x in input_mask]))
-                logger.info(
-                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-                logger.info("concept_ids: %s" % " ".join(["{}:{}".format(tidx, list(filter(lambda index:index != 0, x))) for tidx, x in enumerate(concept_ids)]))
-                if is_training and span_is_impossible:
-                    logger.info("impossible example")
-                if is_training and not span_is_impossible:
-                    answer_text = " ".join(tokens[start_position:(end_position + 1)])
-                    logger.info("start_position: %d" % (start_position))
-                    logger.info("end_position: %d" % (end_position))
-                    logger.info(
-                        "answer: %s" % (answer_text))
+            # if example_index < 2:
+            #     logger.info("*** Example ***")
+            #     logger.info("unique_id: %s" % (unique_id))
+            #     logger.info("example_index: %s" % (example_index))
+            #     logger.info("doc_span_index: %s" % (doc_span_index))
+            #     logger.info("tokens: %s" % " ".join(tokens))
+            #     logger.info("token_to_orig_map: %s" % " ".join([
+            #         "%d:%d" % (x, y) for (x, y) in token_to_orig_map.items()]))
+            #     logger.info("token_is_max_context: %s" % " ".join([
+            #         "%d:%s" % (x, y) for (x, y) in token_is_max_context.items()
+            #     ]))
+            #     logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            #     logger.info(
+            #         "input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            #     logger.info(
+            #         "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+            #     logger.info("concept_ids: %s" % " ".join(["{}:{}".format(tidx, list(filter(lambda index:index != 0, x))) for tidx, x in enumerate(concept_ids)]))
+            #     if is_training and span_is_impossible:
+            #         logger.info("impossible example")
+            #     if is_training and not span_is_impossible:
+            #         answer_text = " ".join(tokens[start_position:(end_position + 1)])
+            #         logger.info("start_position: %d" % (start_position))
+            #         logger.info("end_position: %d" % (end_position))
+            #         logger.info(
+            #             "answer: %s" % (answer_text))
             
             # add concept_ids following
             features.append(
@@ -673,6 +689,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                     input_mask=input_mask, # 1
                     segment_ids=segment_ids, # 2
                     concept_ids=concept_ids,
+                    concept_masks=concept_masks,
                     cls_index=cls_index,
                     p_mask=p_mask,
                     paragraph_len=paragraph_len,
